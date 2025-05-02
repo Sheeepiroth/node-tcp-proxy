@@ -65,12 +65,13 @@ if (argv.exec) {
     console.log(`Executing: ${argv.exec}`);
     console.log(`Connecting to: ${argv.serviceHost}:${argv.servicePort}`);
 
-    const execHandler = proxy.runCommandAndPipe(argv.serviceHost, argv.servicePort, argv.exec, options);
+    const execControl = proxy.runCommandAndPipe(argv.serviceHost, argv.servicePort, argv.exec, options);
 
     process.on("SIGINT", function() {
-        console.log("Received SIGINT. Terminating command and closing connection.");
-        if (execHandler && execHandler.stop) {
-            execHandler.stop();
+        console.log("\nReceived SIGINT. Terminating command and closing connection.");
+        const child = execControl.getChild();
+        if (child && child.kill) {
+            child.kill('SIGINT');
         }
         setTimeout(() => process.exit(0), 500);
     });
