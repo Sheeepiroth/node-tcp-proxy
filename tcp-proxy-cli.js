@@ -6,15 +6,16 @@ argv
     .usage("[options]")
     .version(packageConfig.version)
     .option("-p, --proxyPort <number>",
-        "Proxy port number (required)", parseInt)
-    .option("-h, --hostname [name]", "Name or IP address of host")
+        "Proxy listener port number (required for proxy mode)", parseInt)
+    .option("-h, --hostname [name]", "Name or IP address of host (for proxy listener)")
     .option("-n, --serviceHost <name>",
-        "Name or IP address of service host(s); " +
-        "if this is a comma separated list, " +
-        "performs round-robin load balancing (required)")
-    .option("-s, --servicePort <number>", "Service port number(s); " +
-        "if this a comma separated list," +
-        "it should have as many entries as serviceHost (required)")
+        "Target host name or IP address; " +
+        "if proxy mode and comma separated, performs round-robin; " +
+        "required otherwise.")
+    .option("-s, --servicePort <number>", "Target port number; " +
+        "if proxy mode and comma separated, corresponds to serviceHost; " +
+        "required otherwise.")
+    .option("-e, --execute <command>", "Command to execute locally and pipe over connection (alternative to proxy mode)")
     .option("-m, --localAddress <address>",
         "IP address of interface to use to connect to service")
     .option("-l, --localPort <port>",
@@ -38,21 +39,31 @@ var options = Object.assign(argv, {
     quiet: argv.q === true,
     rejectUnauthorized: argv.rejectUnauthorized !== "false",
     identUsers: argv.identUsers === '' ? [] : argv.identUsers.split(','),
-    allowedIps: argv.allowedIPs === '' ? [] : argv.allowedIPs.split(',')
+    allowedIps: argv.allowedIPs === '' ? [] : argv.allowedIPs.split(','),
+    executeCommand: argv.execute
 });
 
-if (!argv.proxyPort || !argv.serviceHost || !argv.servicePort) {
-    argv.help();
+if (argv.execute) {
+    if (!argv.serviceHost || !argv.servicePort) {
+        console.error("Error: --execute mode requires --serviceHost (-n) and --servicePort (-s).");
+        argv.help();
+        process.exit(1);
+    }
+} else {
+    if (!argv.proxyPort || !argv.serviceHost || !argv.servicePort) {
+        console.error("Error: Proxy mode requires --proxyPort (-p), --serviceHost (-n), and --servicePort (-s).");
+        argv.help();
+        process.exit(1);
+    }
 }
 
-var proxy = require("./tcp-proxy.js").createProxy(argv.proxyPort,
-    argv.serviceHost, argv.servicePort, options);
+var instance = require("./tcp-proxy.js").createProxy(argv.proxyPort, argv.serviceHost, argv.servicePort, options);
 
 process.on("uncaughtException", function(err) {
     console.error(err);
-    proxy.end();
+    if (instance && typeof instance.end === 'function') { instance.end(); }
 });
 
 process.on("SIGINT", function() {
-    proxy.end();
+    if (instance && typeof instance.end === 'function') { instance.end(); }
 });
