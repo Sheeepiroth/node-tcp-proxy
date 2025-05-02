@@ -2,10 +2,186 @@ var net = require("net");
 var tls = require('tls');
 var fs = require('fs');
 var util = require('util');
+var child_process = require('child_process'); // Required for spawn
 
 module.exports.createProxy = function(proxyPort,
     serviceHost, servicePort, options) {
     return new TcpProxy(proxyPort, serviceHost, servicePort, options);
+};
+
+// New function for executing a command and piping I/O over TCP/TLS
+module.exports.runCommandAndPipe = function(serviceHost, servicePort, command, options) {
+    const log = msg => { if (!options.quiet) { console.log(msg); } };
+    let socket = null;
+    let child = null;
+    let retryTimeout = null;
+    let isConnected = false;
+    let userRequestedStop = false; // Flag to prevent retries after SIGINT
+
+    const baseRetryInterval = 60 * 1000; // 60 seconds in milliseconds
+    const jitterFactor = 0.20; // 20%
+
+    const connectOptions = {
+        host: serviceHost,
+        port: parseInt(servicePort, 10),
+        rejectUnauthorized: options.rejectUnauthorized
+    };
+
+    // Parse the command and arguments (only needs to be done once)
+    const commandParts = command.match(/\$?"(?:\\.|[^"\\])*"|\S+/g) || [];
+    const executable = commandParts[0];
+    const args = commandParts.slice(1).map(arg => arg.replace(/^"(.*)"$/, '$1'));
+
+    const cleanup = () => {
+        if (socket) {
+            socket.removeAllListeners(); // Prevent old listeners from firing
+            socket.destroy();
+            socket = null;
+        }
+        if (child && child.kill) {
+            log('Terminating existing child process...');
+            child.kill('SIGTERM'); // Try SIGTERM first
+            // Consider a SIGKILL timeout if SIGTERM doesn't work
+            child = null;
+        }
+        isConnected = false;
+    };
+
+    const scheduleRetry = (isInitialAttempt = false) => {
+        cleanup();
+        if (userRequestedStop) {
+            log('Retry cancelled due to user request.');
+            return;
+        }
+
+        const jitter = (Math.random() * 2 - 1) * jitterFactor * baseRetryInterval;
+        const retryDelay = Math.max(0, baseRetryInterval + jitter); // Ensure delay is non-negative
+
+        log(`Connection ${isInitialAttempt ? 'failed' : 'lost'}. Retrying in ${(retryDelay / 1000).toFixed(1)} seconds...`);
+        clearTimeout(retryTimeout); // Clear any existing retry timeout
+        retryTimeout = setTimeout(connect, retryDelay);
+    };
+
+    const connect = () => {
+        if (userRequestedStop) return;
+        log(`Attempting to connect to ${serviceHost}:${servicePort}...`);
+        cleanup(); // Ensure clean state before connecting
+
+        if (options.tls === 'both') {
+            log('Connecting with TLS...');
+            socket = tls.connect(connectOptions, onConnect);
+        } else {
+            log('Connecting with plain TCP...');
+            socket = net.connect(connectOptions, onConnect);
+        }
+
+        socket.once('error', (err) => {
+            log(`Connection error: ${err.message}`);
+            // If we weren't connected yet, it's an initial failure
+            // If we were connected, the 'close' event will likely handle the retry
+            if (!isConnected) {
+                scheduleRetry(true);
+            }
+        });
+
+        // Use 'once' for close to avoid duplicate retries if error also fires close
+        socket.once('close', () => {
+            if (isConnected) {
+                log('Connection closed.');
+                isConnected = false;
+                scheduleRetry(false);
+            } else {
+                // If close happens before 'connect' fired (e.g. immediate connection refused)
+                // and error didn't schedule a retry, schedule one now.
+                // Avoid scheduling if a retry is already pending
+                if (!retryTimeout) {
+                    log('Connection closed before establishing.');
+                    scheduleRetry(true);
+                }
+            }
+        });
+    };
+
+    const onConnect = () => {
+        clearTimeout(retryTimeout); // Cancel any pending retry
+        retryTimeout = null;
+        isConnected = true;
+        log('Successfully connected.');
+        log(`Spawning command: ${executable} ${args.join(' ')}`);
+
+        try {
+            // Ensure previous child is gone before spawning new one
+            if (child) {
+                 log("Warning: Previous child process detected during reconnect. Attempting termination.");
+                 child.kill('SIGKILL');
+                 child = null;
+            }
+
+            child = child_process.spawn(executable, args, {
+                shell: false
+            });
+
+            // Pipe socket -> child stdin
+            socket.pipe(child.stdin);
+            // Handle socket errors during piping
+            socket.on('error', (err) => {
+                log(`Socket error during pipe: ${err.message}`);
+                // Connection will close, triggering retry via 'close' handler
+            });
+
+            // Pipe child stdout/stderr -> socket
+            child.stdout.pipe(socket, { end: false }); // Don't end socket when stdout closes
+            child.stderr.pipe(socket, { end: false }); // Don't end socket when stderr closes
+
+            // Handle child process errors
+            child.on('error', (err) => {
+                log(`Subprocess error: ${err.message}`);
+                // Don't necessarily schedule retry here, as the connection might still be good.
+                // Let the socket closing trigger the retry if needed.
+                // However, we should close the socket from our end if the child dies unexpectedly.
+                if (socket && !socket.destroyed) {
+                    socket.end(); // Signal end to remote side
+                }
+                child = null; // Mark child as gone
+                // Schedule a retry as the process we need is gone.
+                scheduleRetry(false);
+            });
+
+            child.on('exit', (code, signal) => {
+                log(`Subprocess exited with code ${code}, signal ${signal}`);
+                child = null; // Mark child as gone
+                // If the exit was not due to our cleanup or user request, maybe retry.
+                if (!userRequestedStop && socket && !socket.destroyed) {
+                   log('Child process exited unexpectedly. Closing connection and scheduling retry.');
+                   socket.end(); // Close the connection gracefully
+                   // The socket 'close' event will trigger scheduleRetry
+                } else if (socket && !socket.destroyed) {
+                    // If exit was expected (e.g., SIGINT), just close the socket.
+                    socket.end();
+                }
+            });
+
+        } catch (spawnError) {
+            log(`Error spawning command: ${spawnError.message}`);
+            if (socket && !socket.destroyed) {
+                socket.end();
+            }
+            // Spawning failed, treat as connection loss/failure
+            scheduleRetry(false);
+        }
+    };
+
+    connect(); // Start the initial connection attempt
+
+    // Return an object with a method to stop the process and prevent retries
+    return {
+        stop: () => {
+            log('Stopping execution and preventing further retries.');
+            userRequestedStop = true;
+            clearTimeout(retryTimeout);
+            cleanup();
+        }
+    };
 };
 
 function uniqueKey(socket) {
