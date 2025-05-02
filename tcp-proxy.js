@@ -46,7 +46,7 @@ module.exports.runCommandAndPipe = function(serviceHost, servicePort, command, o
 
         isRetrying = true;
         isConnected = false;
-        const baseDelay = 60 * 1000; // 60 seconds
+        const baseDelay = 30 * 1000; // 60 seconds
         const jitter = baseDelay * 0.20 * (Math.random() * 2 - 1); // +/- 20%
         const delay = Math.max(1000, baseDelay + jitter); // Ensure minimum 1s delay
 
@@ -85,7 +85,7 @@ module.exports.runCommandAndPipe = function(serviceHost, servicePort, command, o
                     child.on('error', (err) => {
                         log(`Failed to start subprocess: ${err.message}`);
                         childHasExited = true; // Mark as exited on spawn error
-                        cleanupSocket(newSocket);
+                        cleanupSocket(socket); // Use current socket
                         clearTimeout(retryTimer);
                         process.exit(1);
                     });
@@ -93,45 +93,51 @@ module.exports.runCommandAndPipe = function(serviceHost, servicePort, command, o
                     child.on('exit', (code, signal) => {
                         log(`Subprocess exited with code ${code}, signal ${signal}`);
                         childHasExited = true;
-                        cleanupSocket(newSocket);
+                        cleanupSocket(socket); // Use current socket
                         clearTimeout(retryTimer); // Stop retrying if child exits
-                        // Optionally exit the main process: process.exit(code ?? 0);
+                        // process.exit(code ?? 0); // Ensure this remains commented unless specifically desired
                     });
 
-                    // Initial piping
-                    newSocket.pipe(child.stdin);
-                    child.stdout.pipe(newSocket);
+                    // Initial piping: Prevent socket closure from ending child stdin
+                    newSocket.pipe(child.stdin, { end: false });
+                    child.stdout.pipe(newSocket); // Let child stdout/stderr end the socket if child exits
                     child.stderr.pipe(newSocket);
 
                 } catch (spawnError) {
                     log(`Error spawning command: ${spawnError.message}`);
                     childHasExited = true;
-                    cleanupSocket(newSocket);
+                    cleanupSocket(socket); // Use current socket
                     clearTimeout(retryTimer);
                     process.exit(1);
                 }
             } else {
                 // Reconnection: Re-pipe to the existing child process
                 log('Re-establishing pipes for existing process.');
-                newSocket.pipe(child.stdin);
-                child.stdout.pipe(newSocket);
+                // Ensure old pipes from the previous socket are removed before creating new ones
+                if (socket && child && child.stdin) socket.unpipe(child.stdin);
+                if (child && child.stdout && socket) child.stdout.unpipe(socket);
+                if (child && child.stderr && socket) child.stderr.unpipe(socket);
+
+                newSocket.pipe(child.stdin, { end: false }); // Prevent socket closure from ending child stdin
+                child.stdout.pipe(newSocket); // Let child stdout/stderr end the socket if child exits
                 child.stderr.pipe(newSocket);
             }
         });
 
         newSocket.on('error', (err) => {
             log(`Connection error: ${err.message}`);
+            const previouslyConnected = isConnected;
+            isConnected = false; // Mark as disconnected regardless
             cleanupSocket(newSocket); // Clean up the failed socket
             socket = null;
-            if (isConnected) {
-                 // Was connected, now lost
-                 isConnected = false;
+
+            // If the child process hasn't exited, we should always attempt to retry.
+            if (!childHasExited) {
+                 log(`Scheduling retry due to error (previously connected: ${previouslyConnected}, currently retrying: ${isRetrying}).`);
                  scheduleRetry();
-            } else if (!isRetrying && !childHasExited) {
-                 // Initial connection failed or retry failed
-                 scheduleRetry();
+            } else {
+                 log("Connection error occurred, but child process has already exited. No retry scheduled.");
             }
-            // If childHasExited, retries are already stopped
         });
 
         newSocket.on('close', () => {
